@@ -28,7 +28,20 @@ def load_ds(key, mesh, ds_path, seq_len, batch_size, n_tokens_valid, n_tokens_tr
     data = np.memmap(ds_path, dtype=np.uint16, shape=[n_batch, batch_size, seq_len], mode='r')
     
     # load data onto jax devices, sharded across batch dimension
-    sharding = jax.sharding.NamedSharding(mesh, P(None, 'data', 'model'))
+    data_axis_size = int(mesh.shape['data'])
+    model_axis_size = int(mesh.shape['model'])
+    if (batch_size % data_axis_size) == 0:
+        pspec = P(None, 'data', 'model')
+    else:
+        # If the (micro)batch is too small to shard across the data axis, replicate it.
+        # This enables opt.batch_size=1 even when multiple devices are used for parameter sharding.
+        pspec = P(None, None, 'model') if (seq_len % model_axis_size) == 0 else P(None, None, None)
+        print(
+            f'warning: batch_size={batch_size} is not divisible by mesh.data={data_axis_size}; '
+            f'replicating the batch dimension (pspec={pspec}).'
+        )
+
+    sharding = jax.sharding.NamedSharding(mesh, pspec)
     callback = lambda index: data[index]
     data = jax.make_array_from_callback(data.shape, sharding, callback)
 

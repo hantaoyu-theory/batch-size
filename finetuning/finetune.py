@@ -64,6 +64,7 @@ def finetune(
     n_data_devices = 1,
     train_parallelism = 'seq', # ['seq', 'batch']
     param_dtype = 'bfloat16',
+    grad_dtype = None, # cast gradients to this dtype before the optimizer step, e.g. 'bfloat16'
     stochastic_round = False,
     remat = False,
     log_every_samples = 100,
@@ -164,7 +165,7 @@ def finetune(
                 attn_mask_batch = jax.device_put(train_attn_mask[idx], NamedSharding(mesh, attn_mask_pspec))
 
                 # training step
-                key, opt_state, batch_loss = train_step(key, opt_state, model_graphdef, opt_graphdef, tokens_batch, pos_batch, attn_mask_batch, loss_mask_batch, use_lora)
+                key, opt_state, batch_loss = train_step(key, opt_state, model_graphdef, opt_graphdef, tokens_batch, pos_batch, attn_mask_batch, loss_mask_batch, use_lora, grad_dtype)
                 
                 # logging
                 train_loss += batch_loss

@@ -7,12 +7,12 @@ seed: 0
 ds_path: null
 tokens_params_ratio: 20 # chinchilla scaling
 num_tokens_train: null
-log_every_tokens: 1_000_000
+log_every_tokens: 1_000_0000
 num_tokens_valid: 20_000_000
 pad_eval: false
 wandb_project: 'picodo-bs'
-wandb_mode: 'disabled'
-run_name: null
+wandb_mode: 'online'
+run_name: 'bs_${opt.batch_size} act_${short_dtype:${model.activ_dtype}} param_${short_dtype:${model.param_dtype}} grad_${short_dtype:${opt.grad_dtype}} lr_${opt.peak_lr}'
 num_tp_devices: 1 # optional tensor parallelism
 
 model:
@@ -48,4 +48,5 @@ opt:
   b2_min: null
   weight_decay: 0
   clip_by_global_norm: null
+  grad_dtype: 'float32' 
   stochastic_round: false

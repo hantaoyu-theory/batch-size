@@ -36,14 +36,22 @@ class ModelAndOptimizer(nnx.Optimizer):
         self.model = model
         self.stochastic_round = stochastic_round # <- CHANGED: added stochastic_round support
 
-    def update(self, key, grads, **kwargs):
+    def update(self, key, grads, grad_dtype=None, **kwargs):
         param_arrays = nnx.to_arrays(nnx.pure(nnx.state(self.model, self.wrt)))
         grad_arrays = nnx.to_arrays(nnx.pure(nnx.state(grads)))
+
+        jax.debug.callback(lambda step, g: print(f'[grad] step={step} BEFORE dtype={g.dtype} vals={g.flatten()[:4]}') if step == 500 else None, self.step.value, jax.tree.leaves(grad_arrays)[0])
+        grad_arrays = jax.tree.map(lambda g: g.astype(grad_dtype), grad_arrays)
+        jax.debug.callback(lambda step, g: print(f'[grad] step={step} AFTER_fp8 dtype={g.dtype} vals={g.flatten()[:4]}') if step == 500 else None, self.step.value, jax.tree.leaves(grad_arrays)[0])
+        grad_arrays = jax.tree.map(lambda g: g.astype(jnp.float32), grad_arrays)
+        jax.debug.callback(lambda step, g: print(f'[grad] step={step} AFTER_fp32 dtype={g.dtype} vals={g.flatten()[:4]}') if step == 500 else None, self.step.value, jax.tree.leaves(grad_arrays)[0])
+
         opt_state_arrays = nnx.to_arrays(nnx.pure(self.opt_state))
         kwargs_arrays = nnx.to_arrays(nnx.pure(kwargs))
 
         updates, new_opt_state = self.tx.update(grad_arrays, opt_state_arrays, param_arrays, **kwargs_arrays)
-        new_params = apply_updates(key, param_arrays, updates, self.stochastic_round) # <- CHANGED: added stochastic_round support
+        new_params = apply_updates(key, param_arrays, updates, self.stochastic_round, self.step.value)
+
 
         nnx.update(self.model, new_params)
         nnx.update(self.opt_state, nnx.state(new_opt_state))
@@ -54,9 +62,11 @@ def apply_updates(
     key: jax.Array,
     params: optax.Params,
     updates: optax.Updates,
-    stochastic_round = False
+    stochastic_round = False,
+    step = None,
 ) -> optax.Params:
     """Extends optax.apply_updates with stochastic rounding."""
+
     keys = otu.tree_split_key_like(key, params)
     def leaf_update(p, u, key):
         if p is None: return None
@@ -65,7 +75,7 @@ def apply_updates(
             p = p.astype(jnp.float32) + u
             p = utils.to_bf16_stochastic(key, p)
         else:
-            p += u
+            p += u.astype(param_dtype)
         return p.astype(param_dtype)
     return jax.tree.map(leaf_update, params, updates, keys, is_leaf=lambda x: x is None)
 
