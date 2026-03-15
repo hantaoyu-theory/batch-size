@@ -1,4 +1,8 @@
 # @package _global_
+# peak_lr for bs1 and bs512 taken from gpt2s_adam_2d.yaml (tuned).
+# peak_lr for other batch sizes interpolated (not tuned).
+# t1 values are not tuned for gpt2s; borrowed from lm11m hparams.
+# t2=10_000_000 taken from gpt2s_adam_2d.yaml.
 
 defaults:
   - /base
@@ -9,39 +13,44 @@ defaults:
 bs_configs:
   bs1:
     opt:
-      peak_lr: 0.0008
-      t1: 100_000
-      t2: 50_000_000
+      peak_lr: 0.000488
+      t1: 40_000
+      t2: 10_000_000
   bs4:
     opt:
-      peak_lr: 0.001
-      t1: 200_000
-      t2: 50_000_000
+      peak_lr: 0.0008
+      t1: 40_000
+      t2: 10_000_000
   bs16:
     opt:
       peak_lr: 0.0015
-      t1: 500_000
-      t2: 50_000_000
+      t1: 60_000
+      t2: 10_000_000
   bs64:
     opt:
-      peak_lr: 0.002
-      t1: 2_000_000
-      t2: 50_000_000
+      peak_lr: 0.0025
+      t1: 200_000
+      t2: 10_000_000
   bs256:
     opt:
-      peak_lr: 0.003
-      t1: 8_000_000
-      t2: 50_000_000
+      peak_lr: 0.0035
+      t1: 1_000_000
+      t2: 10_000_000
+  bs512:
+    opt:
+      peak_lr: 0.0039
+      t1: 2_000_000
+      t2: 10_000_000
   bs1024:
     opt:
-      peak_lr: 0.003
-      t1: 16_000_000
-      t2: 50_000_000
+      peak_lr: 0.004
+      t1: 3_000_000
+      t2: 10_000_000
   bs4096:
     opt:
-      peak_lr: 0.002
-      t1: 32_000_000
-      t2: 50_000_000
+      peak_lr: 0.003
+      t1: 6_000_000
+      t2: 10_000_000
 
 opt:
   optimizer: 'adamw'
