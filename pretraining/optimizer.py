@@ -36,26 +36,335 @@ class ModelAndOptimizer(nnx.Optimizer):
         self.model = model
         self.stochastic_round = stochastic_round # <- CHANGED: added stochastic_round support
 
-    def update(self, key, grads, grad_dtype=None, **kwargs):
+    def update(self, key, grads, grad_dtype=None, report_zero_update_pct: bool = False, **kwargs):
         param_arrays = nnx.to_arrays(nnx.pure(nnx.state(self.model, self.wrt)))
         grad_arrays = nnx.to_arrays(nnx.pure(nnx.state(grads)))
-
-        jax.debug.callback(lambda step, g: print(f'[grad] step={step} BEFORE dtype={g.dtype} vals={g.flatten()[:4]}') if step == 500 else None, self.step.value, jax.tree.leaves(grad_arrays)[0])
-        grad_arrays = jax.tree.map(lambda g: g.astype(grad_dtype), grad_arrays)
-        jax.debug.callback(lambda step, g: print(f'[grad] step={step} AFTER_fp8 dtype={g.dtype} vals={g.flatten()[:4]}') if step == 500 else None, self.step.value, jax.tree.leaves(grad_arrays)[0])
-        grad_arrays = jax.tree.map(lambda g: g.astype(jnp.float32), grad_arrays)
-        jax.debug.callback(lambda step, g: print(f'[grad] step={step} AFTER_fp32 dtype={g.dtype} vals={g.flatten()[:4]}') if step == 500 else None, self.step.value, jax.tree.leaves(grad_arrays)[0])
-
         opt_state_arrays = nnx.to_arrays(nnx.pure(self.opt_state))
         kwargs_arrays = nnx.to_arrays(nnx.pure(kwargs))
+
+        grad_arrays = jax.tree.map(lambda g: g.astype(grad_dtype), grad_arrays)
 
         updates, new_opt_state = self.tx.update(grad_arrays, opt_state_arrays, param_arrays, **kwargs_arrays)
         new_params = apply_updates(key, param_arrays, updates, self.stochastic_round, self.step.value)
 
+        # Metrics returned to the (jitted) caller so they can be logged to wandb in Python.
+        # Tuple:
+        # (zero_update_pct_nonzero_u, adam_snr,
+        #  step_mean_abs_grad, step_mean_sq_grad, step_rms_grad,
+        #  lost_abs_ratio, apply_efficiency)
+        zero_update_pct_nonzero_u = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        adam_snr = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        step_mean_abs_grad = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        step_mean_sq_grad = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        step_rms_grad = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        lost_abs_ratio = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        apply_efficiency = jnp.asarray(jnp.nan, dtype=jnp.float32)
+
+        # report the percentage of weights that are not updated after the update function
+        if report_zero_update_pct:
+            grad_leaves = [
+                jnp.asarray(g, dtype=jnp.float32)
+                for g in jax.tree.leaves(grad_arrays)
+                if (g is not None) and hasattr(g, "dtype") and jnp.issubdtype(jnp.asarray(g).dtype, jnp.floating)
+            ]
+            if grad_leaves:
+                total_grad = jnp.asarray(sum(int(g.size) for g in grad_leaves), dtype=jnp.float32)
+                step_mean_abs_grad = sum(jnp.sum(jnp.abs(g)) for g in grad_leaves) / total_grad
+                step_mean_sq_grad = sum(jnp.sum(jnp.square(g)) for g in grad_leaves) / total_grad
+                step_rms_grad = jnp.sqrt(step_mean_sq_grad)
+
+            def _count_leaf_unchanged(p_old, u, p_new):
+                if p_old is None:
+                    return jnp.zeros((2,), dtype=jnp.int32)
+                p_old = jnp.asarray(p_old)
+                if not jnp.issubdtype(p_old.dtype, jnp.floating):
+                    return jnp.zeros((2,), dtype=jnp.int32)
+                u = jnp.asarray(u)
+                nonzero = (u != 0)
+                unchanged = (p_new == p_old) & nonzero
+                unchanged_count = jnp.sum(unchanged, dtype=jnp.int32)
+                nonzero_count = jnp.sum(nonzero, dtype=jnp.int32)
+                return jnp.stack((unchanged_count, nonzero_count))
+
+            same_total = jax.tree.map(_count_leaf_unchanged, param_arrays, updates, new_params, is_leaf=lambda x: x is None)
+            same_total = jax.tree.reduce(
+                lambda a, b: a + b,
+                same_total,
+                jnp.zeros((2,), dtype=jnp.int32),
+            )
+            same, total = same_total[0], same_total[1]
+            pct = jnp.where(
+                total > 0,
+                100.0 * (same.astype(jnp.float32) / total.astype(jnp.float32)),
+                jnp.nan,
+            )
+            zero_update_pct_nonzero_u = pct.astype(jnp.float32)
+
+            def _weighted_and_efficiency_stats_leaf(p_old, u, p_new):
+                if p_old is None:
+                    return jnp.zeros((4,), dtype=jnp.float32)
+                p_old = jnp.asarray(p_old)
+                if not jnp.issubdtype(p_old.dtype, jnp.floating):
+                    return jnp.zeros((4,), dtype=jnp.float32)
+                u = jnp.asarray(u, dtype=jnp.float32)
+                p_new = jnp.asarray(p_new, dtype=jnp.float32)
+                p_old_f32 = p_old.astype(jnp.float32)
+                nonzero = (u != 0)
+                unchanged = (p_new == p_old_f32) & nonzero
+                abs_u = jnp.abs(u)
+                # Cap |dp| at |u| so bf16 rounding amplification can't push apply_efficiency > 1.
+                effective_dp = jnp.minimum(jnp.abs(p_new - p_old_f32), abs_u)
+                # Returns: [sum|u|_lost, sum|u|_all, sum(min(|dp|,|u|)^2), sum(u^2)]
+                return jnp.stack((
+                    jnp.sum(jnp.where(unchanged, abs_u, 0.0)),
+                    jnp.sum(abs_u),
+                    jnp.sum(jnp.square(effective_dp)),
+                    jnp.sum(jnp.square(u)),
+                ))
+
+            weighted_total = jax.tree.map(
+                _weighted_and_efficiency_stats_leaf,
+                param_arrays,
+                updates,
+                new_params,
+                is_leaf=lambda x: x is None,
+            )
+            weighted_total = jax.tree.reduce(
+                lambda a, b: a + b,
+                weighted_total,
+                jnp.zeros((4,), dtype=jnp.float32),
+            )
+            lost_abs_sum, abs_sum, dp_sq_sum, u_sq_sum = (
+                weighted_total[0],
+                weighted_total[1],
+                weighted_total[2],
+                weighted_total[3],
+            )
+            lost_abs_ratio = jnp.where(abs_sum > 0, lost_abs_sum / abs_sum, jnp.nan).astype(jnp.float32)
+            apply_efficiency = jnp.where(
+                u_sq_sum > 0,
+                jnp.sqrt(dp_sq_sum / u_sq_sum),
+                jnp.nan,
+            ).astype(jnp.float32)
+            jax.debug.callback(
+                lambda step, pct: print(
+                    f'[zero_update_pct_nonzero_u] step={int(step)} pct={float(pct):.2f}%'
+                ) if jax.process_index() == 0 else None,
+                self.step.value,
+                pct,
+            )
+            jax.debug.callback(
+                lambda step, lr, ae: print(
+                    f'[update_quality] step={int(step)} lost_abs_ratio={float(lr):.3e} apply_efficiency={float(ae):.3e}'
+                ) if jax.process_index() == 0 else None,
+                self.step.value,
+                lost_abs_ratio,
+                apply_efficiency,
+            )
+
+            # Per-layer breakdown (grouped by parameter path).
+            GetAttrKey = jax.tree_util.GetAttrKey
+            DictKey = jax.tree_util.DictKey
+            SequenceKey = jax.tree_util.SequenceKey
+
+            def _key_name(k) -> str | None:
+                if isinstance(k, GetAttrKey):
+                    return k.name
+                if isinstance(k, DictKey) and isinstance(k.key, str):
+                    return k.key
+                return None
+
+            def _group_id_from_path(path) -> str:
+                # Handle top-level modules.
+                for k in path:
+                    name = _key_name(k)
+                    if name in ("token_embed_in", "token_embed_out", "out_ln"):
+                        return name
+
+                # Handle transformer blocks: blocks[i].*
+                for i, k in enumerate(path):
+                    is_blocks = (
+                        (isinstance(k, GetAttrKey) and k.name == "blocks")
+                        or (isinstance(k, DictKey) and k.key == "blocks")
+                    )
+                    if not is_blocks:
+                        continue
+
+                    if i + 1 >= len(path):
+                        break
+                    idx_key = path[i + 1]
+                    if isinstance(idx_key, SequenceKey):
+                        block = int(idx_key.idx)
+                    if isinstance(idx_key, DictKey) and isinstance(idx_key.key, int):
+                        block = int(idx_key.key)
+                    if isinstance(idx_key, GetAttrKey):
+                        # Some containers use attribute names like "_0".
+                        if idx_key.name.startswith("_") and idx_key.name[1:].isdigit():
+                            block = int(idx_key.name[1:])
+
+                    if "block" in locals():
+                        # Try to find the submodule within the block.
+                        sub = "other"
+                        # Common container/module names in this repo.
+                        attn_names = {"attn", "qkv_proj", "out_proj", "query_norm", "key_norm", "attention"}
+                        mlp_names = {"mlp", "fc1", "fc2"}
+                        ln1_names = {"ln1"}
+                        ln2_names = {"ln2"}
+                        embed_names = {"token_embed_in", "token_embed_out"}
+
+                        for kk in path[i + 2 :]:
+                            name = _key_name(kk)
+                            if name is None:
+                                continue
+                            if name in ln1_names:
+                                sub = "ln1"
+                                break
+                            if name in ln2_names:
+                                sub = "ln2"
+                                break
+                            if name in attn_names:
+                                sub = "attn"
+                                break
+                            if name in mlp_names:
+                                sub = "mlp"
+                                break
+                            if name in embed_names:
+                                # Shouldn't generally happen inside blocks, but keep it explicit.
+                                sub = name
+                                break
+                        return f"block_{block}.{sub}"
+
+                return "other"
+
+            # Flatten with paths so we can aggregate by layer id.
+            param_path_leaves, _ = jax.tree_util.tree_flatten_with_path(param_arrays)
+            update_path_leaves, _ = jax.tree_util.tree_flatten_with_path(updates)
+            new_param_path_leaves, _ = jax.tree_util.tree_flatten_with_path(new_params)
+
+            # Build a stable list of layer ids and sum counts into each.
+            group_sums: dict[str, jax.Array] = {}
+            for (p_path, p_leaf), (u_path, u_leaf), (n_path, n_leaf) in zip(
+                param_path_leaves,
+                update_path_leaves,
+                new_param_path_leaves,
+            ):
+                # These should align structurally; if they don't, skip.
+                if (p_path != u_path) or (p_path != n_path):
+                    continue
+                group = _group_id_from_path(p_path)
+                counts = _count_leaf_unchanged(p_leaf, u_leaf, n_leaf)
+                group_sums[group] = counts if group not in group_sums else (group_sums[group] + counts)
+
+            # Print a compact one-line summary.
+            if group_sums:
+                sub_order = {"ln1": 0, "attn": 1, "ln2": 2, "mlp": 3, "other": 9}
+
+                def _sort_key(name: str):
+                    if name in ("token_embed_in", "token_embed_out"):
+                        return (0, 0 if name == "token_embed_in" else 1, 0, 0)
+                    if name == "out_ln":
+                        return (1, 0, 0, 0)
+                    if name.startswith("block_"):
+                        # block_{i}.{sub}
+                        block_part, _, sub = name.partition(".")
+                        block_idx = block_part[6:]
+                        if block_idx.isdigit():
+                            return (2, int(block_idx), sub_order.get(sub, 99), 0)
+                        return (2, 10_000_000, sub_order.get(sub, 99), 0)
+                    if name == "other":
+                        return (3, 0, 0, 0)
+                    return (2, 10_000_001, 99, 0)
+
+                group_names = sorted(group_sums.keys(), key=_sort_key)
+                group_stats = jnp.stack(
+                    [
+                        jnp.stack(
+                            (
+                                jnp.where(
+                                    group_sums[name][1] > 0,
+                                    100.0
+                                    * (
+                                        group_sums[name][0].astype(jnp.float32)
+                                        / group_sums[name][1].astype(jnp.float32)
+                                    ),
+                                    jnp.nan,
+                                ),
+                                group_sums[name][1].astype(jnp.float32),
+                            )
+                        )
+                        for name in group_names
+                    ],
+                    axis=0,
+                )
+
+                def _print_group_stats(step, stats):
+                    if jax.process_index() != 0:
+                        return
+                    # Print in chunks to keep lines readable.
+                    parts = [f"{name}={float(stats[i,0]):.2f}%({int(stats[i,1])})" for i, name in enumerate(group_names)]
+                    chunk = 8
+                    for j in range(0, len(parts), chunk):
+                        prefix = "[zero_update_pct_nonzero_u_by_group]" if j == 0 else " " * 33
+                        print(f"{prefix} step={int(step)} " + ", ".join(parts[j:j+chunk]))
+
+                jax.debug.callback(_print_group_stats, self.step.value, group_stats)
+
+            # AdamW moments: mu (1st moment) and nu (2nd moment)
+            state_path_leaves, _ = jax.tree_util.tree_flatten_with_path(new_opt_state)
+            mu_leaves = []
+            nu_leaves = []
+            for path, leaf in state_path_leaves:
+                if not hasattr(leaf, "dtype"):
+                    continue
+                leaf = jnp.asarray(leaf)
+                if not jnp.issubdtype(leaf.dtype, jnp.floating):
+                    continue
+                key = jax.tree_util.keystr(path)
+                if key.endswith(".mu") or (".mu" in key):
+                    mu_leaves.append(leaf.astype(jnp.float32))
+                if key.endswith(".nu") or (".nu" in key):
+                    nu_leaves.append(leaf.astype(jnp.float32))
+
+            if mu_leaves and nu_leaves and len(mu_leaves) == len(nu_leaves):
+                total = jnp.asarray(sum(int(x.size) for x in mu_leaves), dtype=jnp.float32)
+                eps_adam = 1e-8
+                snr_sum = sum(
+                    jnp.sum(jnp.abs(m) / (jnp.sqrt(n) + eps_adam))
+                    for m, n in zip(mu_leaves, nu_leaves)
+                )
+                adam_snr = (snr_sum / total).astype(jnp.float32)
+
+                jax.debug.callback(
+                    lambda step, snr: print(
+                        f'[adam_snr] step={int(step)} adam_snr={float(snr):.3e}'
+                    ) if jax.process_index() == 0 else None,
+                    self.step.value,
+                    adam_snr,
+                )
+
+            if grad_leaves:
+                jax.debug.callback(
+                    lambda step, mag, msg, rmsg: print(
+                        f'[step_grad_stats] step={int(step)} mean_abs_grad={float(mag):.3e} mean_sq_grad={float(msg):.3e} rms_grad={float(rmsg):.3e}'
+                    ) if jax.process_index() == 0 else None,
+                    self.step.value,
+                    step_mean_abs_grad,
+                    step_mean_sq_grad,
+                    step_rms_grad,
+                )
 
         nnx.update(self.model, new_params)
         nnx.update(self.opt_state, nnx.state(new_opt_state))
         self.step[...] += 1
+        return (
+            zero_update_pct_nonzero_u,
+            adam_snr,
+            step_mean_abs_grad,
+            step_mean_sq_grad,
+            step_rms_grad,
+            lost_abs_ratio,
+            apply_efficiency,
+        )
 
 
 def apply_updates(
@@ -75,8 +384,10 @@ def apply_updates(
             p = p.astype(jnp.float32) + u
             p = utils.to_bf16_stochastic(key, p)
         else:
-            p += u.astype(param_dtype)
-        return p.astype(param_dtype)
+            # Compute in float32 then cast once, avoiding double-rounding when param_dtype=bfloat16.
+            # (p += u.astype(param_dtype) would first round u to param_dtype, then add — two roundings.)
+            p = (p.astype(jnp.float32) + u).astype(param_dtype)
+        return p
     return jax.tree.map(leaf_update, params, updates, keys, is_leaf=lambda x: x is None)
 
 
@@ -89,7 +400,8 @@ def get_optimizer(c: DictConfig, num_opt_steps: int, tokens_per_opt_step: int):
 
     # get schedule
     warmup_steps = int(c.warmup_frac * num_opt_steps)
-    lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.peak_lr, warmup_steps, num_opt_steps)
+    end_lr = c.peak_lr * c.end_lr_frac
+    lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.peak_lr, warmup_steps, num_opt_steps, end_value=end_lr)
 
     # convert (t1 <-> b1), (t2 <-> b2)
     assert (c.b1 is None) | (c.t1 is None) # at most one can be specified in config

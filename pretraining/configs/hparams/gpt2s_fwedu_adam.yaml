@@ -1,0 +1,47 @@
+# @package _global_
+
+defaults:
+  - /base
+  - /model/gpt2s
+  - /dataset/fwedu_gpt2
+  - _self_
+
+bs_configs:
+  bs1:
+    opt:
+      peak_lr: 0.0008
+      t1: 100_000
+      t2: 50_000_000
+  bs4:
+    opt:
+      peak_lr: 0.001
+      t1: 200_000
+      t2: 50_000_000
+  bs16:
+    opt:
+      peak_lr: 0.0015
+      t1: 500_000
+      t2: 50_000_000
+  bs64:
+    opt:
+      peak_lr: 0.002
+      t1: 2_000_000
+      t2: 50_000_000
+  bs256:
+    opt:
+      peak_lr: 0.003
+      t1: 8_000_000
+      t2: 50_000_000
+  bs1024:
+    opt:
+      peak_lr: 0.003
+      t1: 16_000_000
+      t2: 50_000_000
+  bs4096:
+    opt:
+      peak_lr: 0.002
+      t1: 32_000_000
+      t2: 50_000_000
+
+opt:
+  optimizer: 'adamw'

@@ -12,7 +12,7 @@ num_tokens_valid: 20_000_000
 pad_eval: false
 wandb_project: 'picodo-bs'
 wandb_mode: 'online'
-run_name: 'bs_${opt.batch_size} act_${short_dtype:${model.activ_dtype}} param_${short_dtype:${model.param_dtype}} grad_${short_dtype:${opt.grad_dtype}} lr_${opt.peak_lr}'
+run_name: 'bs_${opt.batch_size} act_${short_dtype:${model.activ_dtype}} param_${short_dtype:${model.param_dtype}} grad_${short_dtype:${opt.grad_dtype}} lr_${opt.peak_lr} sr_${opt.stochastic_round}'
 num_tp_devices: 1 # optional tensor parallelism
 
 model:
@@ -37,6 +37,7 @@ opt:
   peak_lr: null
   peak_lr_scaled: null
   peak_lr_scaling: null
+  end_lr_frac: 0.0
   muon_lr: null
   warmup_frac: 0.05
   b1: null

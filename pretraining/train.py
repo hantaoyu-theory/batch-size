@@ -24,36 +24,44 @@ def loss_fn(model_state, model_graphdef, x, pad=False): # [B, T]
     return (losses * loss_mask).sum() / loss_mask.sum()
 
 
-@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef', 'grad_dtype'), donate_argnames=('opt_state'))
-def train_step(key, opt_state, opt_graphdef, model_graphdef, batch, grad_dtype=None):
+@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef', 'grad_dtype', 'report_zero_update_pct'))
+def train_step(key, opt_state, opt_graphdef, model_graphdef, batch, grad_dtype=None, report_zero_update_pct: bool = False):
     key, key_opt = jax.random.split(key)
 
     # compute grads from a single micro-batch
     if batch.ndim == 2:
-
-        if grad_dtype == "float32":
+        if grad_dtype is not None:
             params_for_grad = jax.tree.map(lambda p: p.astype(grad_dtype), opt_state.model)
-            loss, grads = jax.value_and_grad(loss_fn)(params_for_grad, model_graphdef, batch)
         else:
-            loss, grads = jax.value_and_grad(loss_fn)(opt_state.model, model_graphdef, batch)
+            params_for_grad = opt_state.model
+        loss, grads = jax.value_and_grad(loss_fn)(params_for_grad, model_graphdef, batch)
 
     # compute grads from multiple micro-batches (using gradient accumulation)
     if batch.ndim == 3:
-        raise ValueError("gradient accumulation (batch.ndim==3) is not supported")
         loss = 0
         grads = otu.tree_zeros_like(opt_state.model, dtype=jnp.float32)
+        if grad_dtype is not None:
+            params_for_grad = jax.tree.map(lambda p: p.astype(grad_dtype), opt_state.model)
+        else:
+            params_for_grad = opt_state.model
+
         def step_fn(i , args):
             loss, grads = args
-            batch_loss, batch_grads = jax.value_and_grad(loss_fn)(opt_state.model, model_graphdef, batch[i])
+            batch_loss, batch_grads = jax.value_and_grad(loss_fn)(params_for_grad, model_graphdef, batch[i])
             loss = (i*loss + batch_loss) / (i+1)
             grads = jax.tree.map(lambda m, g: (i*m + g) / (i+1), grads, batch_grads)
             return loss, grads
-        loss, grads = jax.lax.fori_loop(0, len(batch), step_fn, (loss, grads))
+        loss, grads = jax.lax.fori_loop(0, batch.shape[0], step_fn, (loss, grads))
 
     optimizer = nnx.merge(opt_graphdef, opt_state)
-    optimizer.update(key_opt, grads, grad_dtype=grad_dtype)
+    update_metrics = optimizer.update(
+        key_opt,
+        grads,
+        grad_dtype=grad_dtype,
+        report_zero_update_pct=report_zero_update_pct,
+    )
     opt_state = nnx.state(optimizer)
-    return key, opt_state, loss
+    return key, opt_state, loss, update_metrics
 
 
 def eval_step(model_state, model_graphdef, dataset, pad=False):
@@ -114,6 +122,13 @@ def train_and_evaluate(c: DictConfig):
         wandb.define_metric('train_tokens_seen')
         wandb.define_metric('train_loss', step_metric='train_tokens_seen')
         wandb.define_metric('eval_loss', step_metric='train_tokens_seen')
+        wandb.define_metric('zero_update_pct_nonzero_u', step_metric='train_tokens_seen')
+        wandb.define_metric('adam_snr', step_metric='train_tokens_seen')
+        wandb.define_metric('step_mean_abs_grad', step_metric='train_tokens_seen')
+        wandb.define_metric('step_mean_sq_grad', step_metric='train_tokens_seen')
+        wandb.define_metric('step_rms_grad', step_metric='train_tokens_seen')
+        wandb.define_metric('lost_abs_ratio', step_metric='train_tokens_seen')
+        wandb.define_metric('apply_efficiency', step_metric='train_tokens_seen')
         # log initial validation before any optimizer step
         init_eval_loss = eval_step(opt_state.model, model_graphdef, ds_valid, c.pad_eval)
         wandb.log({
@@ -132,19 +147,39 @@ def train_and_evaluate(c: DictConfig):
             batch = ds_train[step] # [batch_size, T]
         if c.opt.grad_acc_steps > 1:
             batch = ds_train[step*c.opt.grad_acc_steps:(step+1)*c.opt.grad_acc_steps] # [grad_acc_steps, micro_batch_size, T]
+            if step == 0 and jax.process_index() == 0:
+                print(f"batch.ndim={batch.ndim}")
+
+        do_eval = (train_loss_num + 1) * tokens_per_opt_step >= c.log_every_tokens
 
         # training step
-        key, opt_state, batch_loss = train_step(key, opt_state, opt_graphdef, model_graphdef, batch, c.opt.grad_dtype)
+        key, opt_state, batch_loss, update_metrics = train_step(
+            key,
+            opt_state,
+            opt_graphdef,
+            model_graphdef,
+            batch,
+            c.opt.grad_dtype,
+            report_zero_update_pct=do_eval,
+        )
 
         # logging
         train_loss_sum += batch_loss
         train_loss_num += 1
-        if train_loss_num * tokens_per_opt_step >= c.log_every_tokens:
+        if do_eval:
             eval_loss = eval_step(opt_state.model, model_graphdef, ds_valid, c.pad_eval)
             metrics = {}
             metrics['train_loss'] = train_loss_sum / train_loss_num
             metrics['eval_loss'] = eval_loss
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
+            # Logged at the same cadence as eval_loss (do_eval steps).
+            metrics['zero_update_pct_nonzero_u'] = float(update_metrics[0])
+            metrics['adam_snr'] = float(update_metrics[1])
+            metrics['step_mean_abs_grad'] = float(update_metrics[2])
+            metrics['step_mean_sq_grad'] = float(update_metrics[3])
+            metrics['step_rms_grad'] = float(update_metrics[4])
+            metrics['lost_abs_ratio'] = float(update_metrics[5])
+            metrics['apply_efficiency'] = float(update_metrics[6])
             if jax.process_index() == 0:
                 wandb.log(metrics)
                 pbar.set_postfix_str(f'train={metrics["train_loss"]:.2f}, eval={metrics["eval_loss"]:.2f}')
