@@ -1,7 +1,11 @@
-jax
+# Pin JAX to a version compatible with `flax==0.12.0` (NNX) on TPU VMs.
+jax[tpu]==0.7.2
 flax==0.12.0
 optax
 numpy
 tqdm
 hydra-core
 wandb
+fire
+huggingface_hub
+chex

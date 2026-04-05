@@ -54,3 +54,5 @@ bs_configs:
 
 opt:
   optimizer: 'adamw'
+
+wandb_project: 'gpt2s'

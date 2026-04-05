@@ -28,13 +28,21 @@ class ModelAndOptimizer(nnx.Optimizer):
     1) enabling stochastic rounding, and
     2) not copying model metadata onto optimizer (otherwise Adafactor fails with a sharded model).
     """
-    def __init__(self, model, tx, wrt=nnx.Param, stochastic_round=False):
+    def __init__(self, model, tx, wrt=nnx.Param, stochastic_round=False, rounding_flip_steps=0):
         self.step = nnx.OptState(jnp.array(0, dtype=jnp.uint32))
         self.tx = tx
-        self.opt_state = nnx.data(to_opt_state(tx.init(nnx.state(model, wrt)))) # <- CHANGED: doesn't copy metadata
+        # Upcast float leaves to fp32 BEFORE wrapping in NNX containers, while
+        # the optax state is still a plain pytree of jax arrays.
+        raw_tx_state = tx.init(nnx.state(model, wrt))
+        raw_tx_state = jax.tree.map(
+            lambda x: x.astype(jnp.float32) if hasattr(x, 'dtype') and jnp.issubdtype(x.dtype, jnp.floating) else x,
+            raw_tx_state,
+        )
+        self.opt_state = nnx.data(to_opt_state(raw_tx_state)) # <- CHANGED: doesn't copy metadata
         self.wrt = wrt
         self.model = model
-        self.stochastic_round = stochastic_round # <- CHANGED: added stochastic_round support
+        self.stochastic_round = stochastic_round
+        self.rounding_flip_steps = rounding_flip_steps
 
     def update(self, key, grads, grad_dtype=None, report_zero_update_pct: bool = False, **kwargs):
         param_arrays = nnx.to_arrays(nnx.pure(nnx.state(self.model, self.wrt)))
@@ -42,16 +50,20 @@ class ModelAndOptimizer(nnx.Optimizer):
         opt_state_arrays = nnx.to_arrays(nnx.pure(self.opt_state))
         kwargs_arrays = nnx.to_arrays(nnx.pure(kwargs))
 
+        grad_arrays_raw = grad_arrays  # save pre-gcast grads for relative error metric
         grad_arrays = jax.tree.map(lambda g: g.astype(grad_dtype), grad_arrays)
 
         updates, new_opt_state = self.tx.update(grad_arrays, opt_state_arrays, param_arrays, **kwargs_arrays)
-        new_params = apply_updates(key, param_arrays, updates, self.stochastic_round, self.step.value)
+        new_params = apply_updates(key, param_arrays, updates, self.stochastic_round, self.step.value, self.rounding_flip_steps)
 
         # Metrics returned to the (jitted) caller so they can be logged to wandb in Python.
         # Tuple:
         # (zero_update_pct_nonzero_u, adam_snr,
         #  step_mean_abs_grad, step_mean_sq_grad, step_rms_grad,
-        #  lost_abs_ratio, apply_efficiency)
+        #  lost_abs_ratio, apply_efficiency,
+        #  gcast_rel_error, pcast_rel_error,
+        #  gcast_max_rel_error, pcast_max_rel_error,
+        #  pcast_u_weighted_rel_error, pcast_frac_above_eps)
         zero_update_pct_nonzero_u = jnp.asarray(jnp.nan, dtype=jnp.float32)
         adam_snr = jnp.asarray(jnp.nan, dtype=jnp.float32)
         step_mean_abs_grad = jnp.asarray(jnp.nan, dtype=jnp.float32)
@@ -59,6 +71,12 @@ class ModelAndOptimizer(nnx.Optimizer):
         step_rms_grad = jnp.asarray(jnp.nan, dtype=jnp.float32)
         lost_abs_ratio = jnp.asarray(jnp.nan, dtype=jnp.float32)
         apply_efficiency = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        gcast_rel_error = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        pcast_rel_error = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        gcast_max_rel_error = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        pcast_max_rel_error = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        pcast_u_weighted_rel_error = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        pcast_frac_above_eps = jnp.asarray(jnp.nan, dtype=jnp.float32)
 
         # report the percentage of weights that are not updated after the update function
         if report_zero_update_pct:
@@ -353,17 +371,123 @@ class ModelAndOptimizer(nnx.Optimizer):
                     step_rms_grad,
                 )
 
+            # gcast relative error: mean(|G(g) - g| / (|g| + eps)) over all gradient elements
+            _eps = jnp.asarray(1e-10, dtype=jnp.float32)
+            raw_float_leaves = [
+                jnp.asarray(g, dtype=jnp.float32)
+                for g in jax.tree.leaves(grad_arrays_raw)
+                if (g is not None) and hasattr(g, "dtype") and jnp.issubdtype(jnp.asarray(g).dtype, jnp.floating)
+            ]
+            cast_float_leaves = [
+                jnp.asarray(g, dtype=jnp.float32)
+                for g in jax.tree.leaves(grad_arrays)
+                if (g is not None) and hasattr(g, "dtype") and jnp.issubdtype(jnp.asarray(g).dtype, jnp.floating)
+            ]
+            if raw_float_leaves and len(raw_float_leaves) == len(cast_float_leaves):
+                total_g = jnp.asarray(sum(int(g.size) for g in raw_float_leaves), dtype=jnp.float32)
+                rel_err_leaves = [
+                    jnp.abs(gc - gr) / (jnp.abs(gr) + _eps)
+                    for gr, gc in zip(raw_float_leaves, cast_float_leaves)
+                ]
+                gcast_rel_error = (
+                    sum(jnp.sum(e) for e in rel_err_leaves) / total_g
+                ).astype(jnp.float32)
+                gcast_max_rel_error = jnp.max(
+                    jnp.stack([jnp.max(e) for e in rel_err_leaves])
+                ).astype(jnp.float32)
+                jax.debug.callback(
+                    lambda step, e, mx: print(
+                        f'[gcast_rel_error] step={int(step)} mean={float(e):.3e} max={float(mx):.3e}'
+                    ) if jax.process_index() == 0 else None,
+                    self.step.value,
+                    gcast_rel_error,
+                    gcast_max_rel_error,
+                )
+
+            # pcast stats: mean, max, |u|-weighted mean, frac above bf16-eps threshold
+            # Computed from deterministic pcast (does not use new_params to avoid CSE aliasing).
+            # For bf16 params, use explicit bit truncation to avoid XLA folding
+            # fp32->bf16->fp32 casts into identity on TPU.
+            # Accumulator layout: [sum(rel_err), max(rel_err), count,
+            #                      sum(rel_err*|u|), sum(|u|), sum(rel_err > 2e-3)]
+            _bf16_eps_thresh = jnp.asarray(2e-3, dtype=jnp.float32)
+            _bf16_mask = jnp.asarray(0xFFFF0000, dtype=jnp.uint32)
+
+            def _pcast_rel_error_leaf(p_old, u):
+                if p_old is None:
+                    return jnp.zeros((6,), dtype=jnp.float32)
+                p_old = jnp.asarray(p_old)
+                if not jnp.issubdtype(p_old.dtype, jnp.floating):
+                    return jnp.zeros((6,), dtype=jnp.float32)
+                u_f32 = jnp.asarray(u, dtype=jnp.float32)
+                x = p_old.astype(jnp.float32) + u_f32
+                if p_old.dtype == jnp.bfloat16:
+                    x_bits = jax.lax.bitcast_convert_type(x, jnp.uint32)
+                    x_bits_trunc = jax.lax.bitwise_and(x_bits, _bf16_mask)
+                    x_pcast = jax.lax.bitcast_convert_type(x_bits_trunc, jnp.float32)
+                else:
+                    x_pcast = x.astype(p_old.dtype).astype(jnp.float32)
+                abs_u = jnp.abs(u_f32)
+                rel_err = jnp.abs(x_pcast - x) / (jnp.abs(x) + _eps)
+                return jnp.stack((
+                    jnp.sum(rel_err),
+                    jnp.max(rel_err),
+                    jnp.asarray(p_old.size, dtype=jnp.float32),
+                    jnp.sum(rel_err * abs_u),
+                    jnp.sum(abs_u),
+                    jnp.sum(jnp.where(rel_err > _bf16_eps_thresh, 1.0, 0.0)),
+                ))
+
+            pcast_totals = jax.tree.map(
+                _pcast_rel_error_leaf, param_arrays, updates, is_leaf=lambda x: x is None
+            )
+            pcast_totals = jax.tree.reduce(
+                lambda a, b: jnp.stack((
+                    a[0] + b[0], jnp.maximum(a[1], b[1]), a[2] + b[2],
+                    a[3] + b[3], a[4] + b[4], a[5] + b[5],
+                )),
+                pcast_totals,
+                jnp.zeros((6,), dtype=jnp.float32),
+            )
+            pcast_rel_error = jnp.where(
+                pcast_totals[2] > 0, pcast_totals[0] / pcast_totals[2], jnp.nan
+            ).astype(jnp.float32)
+            pcast_max_rel_error = pcast_totals[1].astype(jnp.float32)
+            pcast_u_weighted_rel_error = jnp.where(
+                pcast_totals[4] > 0, pcast_totals[3] / pcast_totals[4], jnp.nan
+            ).astype(jnp.float32)
+            pcast_frac_above_eps = jnp.where(
+                pcast_totals[2] > 0, pcast_totals[5] / pcast_totals[2], jnp.nan
+            ).astype(jnp.float32)
+            jax.debug.callback(
+                lambda step, e, mx, uw, fa: print(
+                    f'[pcast_rel_error] step={int(step)} mean={float(e):.3e} max={float(mx):.3e}'
+                    f' u_weighted={float(uw):.3e} frac_above_eps={float(fa):.3e}'
+                ) if jax.process_index() == 0 else None,
+                self.step.value,
+                pcast_rel_error,
+                pcast_max_rel_error,
+                pcast_u_weighted_rel_error,
+                pcast_frac_above_eps,
+            )
+
         nnx.update(self.model, new_params)
         nnx.update(self.opt_state, nnx.state(new_opt_state))
         self.step[...] += 1
         return (
-            zero_update_pct_nonzero_u,
-            adam_snr,
-            step_mean_abs_grad,
-            step_mean_sq_grad,
-            step_rms_grad,
-            lost_abs_ratio,
-            apply_efficiency,
+            zero_update_pct_nonzero_u,   # [0]
+            adam_snr,                    # [1]
+            step_mean_abs_grad,          # [2]
+            step_mean_sq_grad,           # [3]
+            step_rms_grad,               # [4]
+            lost_abs_ratio,              # [5]
+            apply_efficiency,            # [6]
+            gcast_rel_error,             # [7]
+            pcast_rel_error,             # [8]
+            gcast_max_rel_error,         # [9]
+            pcast_max_rel_error,         # [10]
+            pcast_u_weighted_rel_error,  # [11]
+            pcast_frac_above_eps,        # [12]
         )
 
 
@@ -373,19 +497,34 @@ def apply_updates(
     updates: optax.Updates,
     stochastic_round = False,
     step = None,
+    rounding_flip_steps = 0,
 ) -> optax.Params:
-    """Extends optax.apply_updates with stochastic rounding."""
+    """Extends optax.apply_updates with stochastic rounding or flip rounding."""
 
     keys = otu.tree_split_key_like(key, params)
+    _mask_upper = jnp.uint32(0xFFFF0000)
+    _mask_lower = jnp.uint32(0x0000FFFF)
+    _one_ulp = jnp.uint32(0x00010000)
+    _zero_u32 = jnp.uint32(0)
+
     def leaf_update(p, u, key):
         if p is None: return None
         param_dtype = jnp.asarray(p).dtype
         if stochastic_round:
             p = p.astype(jnp.float32) + u
             p = utils.to_bf16_stochastic(key, p)
+        elif rounding_flip_steps > 0 and param_dtype == jnp.bfloat16:
+            # Alternate between truncation (toward zero) and round-away (away from zero)
+            # every rounding_flip_steps steps. Over two periods the bias cancels.
+            x = p.astype(jnp.float32) + u
+            x_bits = jax.lax.bitcast_convert_type(x, jnp.uint32)
+            x_trunc = jax.lax.bitwise_and(x_bits, _mask_upper)
+            has_frac = (jax.lax.bitwise_and(x_bits, _mask_lower) != _zero_u32)
+            x_away = x_trunc + jnp.where(has_frac, _one_ulp, _zero_u32)
+            use_away = ((step // rounding_flip_steps) % 2) == 1
+            result_bits = jnp.where(use_away, x_away, x_trunc)
+            p = jax.lax.bitcast_convert_type(result_bits, jnp.float32).astype(jnp.bfloat16)
         else:
-            # Compute in float32 then cast once, avoiding double-rounding when param_dtype=bfloat16.
-            # (p += u.astype(param_dtype) would first round u to param_dtype, then add — two roundings.)
             p = (p.astype(jnp.float32) + u).astype(param_dtype)
         return p
     return jax.tree.map(leaf_update, params, updates, keys, is_leaf=lambda x: x is None)

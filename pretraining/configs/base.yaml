@@ -51,3 +51,5 @@ opt:
   clip_by_global_norm: null
   grad_dtype: 'float32' 
   stochastic_round: false
+  rounding_flip_steps: 0  # 0=disabled; >0: alternate trunc/round-away every N steps
+  shadow_fp32: false  # if true, train a shadow fp32 model in parallel and log grad comparison
