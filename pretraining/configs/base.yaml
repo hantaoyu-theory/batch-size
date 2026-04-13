@@ -38,6 +38,22 @@ opt:
   peak_lr_scaled: null
   peak_lr_scaling: null
   end_lr_frac: 0.0
+  init_lr_boost_factor: 1.0
+  init_lr_boost_tokens: 0
+  perturb_at_tokens: 0
+  perturb_std_frac: 0.0
+  initial_batch_size: null
+  initial_phase_max_microbatch_size: null
+  initial_batch_tokens: 0
+  initial_phase_peak_lr: null
+  initial_phase_t1: null
+  initial_phase_t2: null
+  switch_batch_size: null
+  switch_phase_max_microbatch_size: null
+  switch_at_tokens: 0
+  switch_phase_peak_lr: null
+  switch_phase_t1: null
+  switch_phase_t2: null
   muon_lr: null
   warmup_frac: 0.05
   b1: null
@@ -52,4 +68,3 @@ opt:
   grad_dtype: 'float32' 
   stochastic_round: false
   rounding_flip_steps: 0  # 0=disabled; >0: alternate trunc/round-away every N steps
-  shadow_fp32: false  # if true, train a shadow fp32 model in parallel and log grad comparison
